@@ -1,0 +1,989 @@
+from google.colab import drive
+drive.mount('/content/drive')
+
+!pip install Kaggle
+
+from google.colab import files
+files.upload()  # Choose kaggle.json
+
+!mkdir -p ~/.kaggle
+!mv kaggle.json ~/.kaggle/
+!chmod 600 ~/.kaggle/kaggle.json
+
+!kaggle datasets download -d chethuhn/network-intrusion-dataset -p /content/drive/MyDrive/CICIDS2017 --unzip
+
+!ls -lh /content/drive/MyDrive/CICIDS2017
+
+import pandas as pd
+import numpy as np
+import os
+import glob
+
+files = glob.glob("/content/drive/MyDrive/CICIDS2017")  # adjust path to your dataset folder
+print("Found files:", files)
+
+!ls "/content/drive/MyDrive"
+
+!ls "/content/drive/MyDrive/CICIDS2017"
+
+import pandas as pd
+import glob
+import numpy as np
+from sklearn.preprocessing import LabelEncoder, MinMaxScaler
+from sklearn.model_selection import train_test_split
+import joblib
+import os
+
+# === 1. Load all CSVs ===
+path = "/content/drive/MyDrive/CICIDS2017"
+all_files = glob.glob(path + "/**/*.csv", recursive=True)
+print(f"Found {len(all_files)} CSV files.")
+
+if not all_files:
+    raise FileNotFoundError(f"No CSV files found in {path}")
+
+df = pd.concat([pd.read_csv(f) for f in all_files], ignore_index=True)
+print("Initial Shape:", df.shape)
+
+# === 2. Clean column names (strip spaces) ===
+df.columns = df.columns.str.strip()
+
+# === 3. Basic cleaning ===
+df = df.replace([np.inf, -np.inf], np.nan).dropna().drop_duplicates()
+print("After cleaning:", df.shape)
+
+# === 4. Drop unnecessary ID columns ===
+drop_cols = ['Flow ID', 'Source IP', 'Destination IP', 'Timestamp', 'Unnamed: 0']
+df.drop(columns=[c for c in drop_cols if c in df.columns], inplace=True)
+
+# === 5. Separate labels ===
+if 'Label' not in df.columns:
+    raise ValueError(f"'Label' column not found! Columns are: {df.columns.tolist()}")
+
+labels = df.pop('Label')
+
+# === 6. Encode categorical features ===
+for col in df.select_dtypes(include=['object']).columns:
+    df[col] = LabelEncoder().fit_transform(df[col].astype(str))
+
+# === 7. Prepare X, y ===
+X_all = df.values
+y_all = (labels != 'BENIGN').astype(int)  # 0 = benign, 1 = attack
+
+# === 8. Benign-only data for GAN training ===
+X_benign = X_all[y_all == 0]
+
+# Scale features (fit only on benign)
+scaler = MinMaxScaler().fit(X_benign)
+
+X_benign_scaled = scaler.transform(X_benign)
+X_all_scaled = scaler.transform(X_all)
+
+# === 9. Split benign into train/val for GAN ===
+X_benign_train, X_benign_val = train_test_split(X_benign_scaled, test_size=0.15, random_state=42)
+
+# === 10. Mixed test set ===
+X_test, y_test = X_all_scaled, y_all
+
+# === 11. Save to Drive ===
+save_path = "/content/drive/MyDrive/CICIDS2017_Preprocessed"
+os.makedirs(save_path, exist_ok=True)
+
+np.save(f"{save_path}/X_benign_train.npy", X_benign_train)
+np.save(f"{save_path}/X_benign_val.npy", X_benign_val)
+np.save(f"{save_path}/X_test.npy", X_test)
+np.save(f"{save_path}/y_test.npy", y_test)
+joblib.dump(scaler, f"{save_path}/scaler.pkl")
+
+print("✅ Preprocessing complete!")
+print(f"Benign train: {X_benign_train.shape}, Benign val: {X_benign_val.shape}")
+print(f"Test set: {X_test.shape}, Attack samples in test: {y_test.sum()}")
+
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+import os
+
+BASE = "/content/drive/MyDrive/CICIDS2017_Preprocessed"
+for f in ["X_benign_train.npy","X_benign_val.npy","X_test.npy","y_test.npy","scaler.pkl"]:
+    print(f, "→", os.path.exists(f"{BASE}/{f}"))
+
+
+import numpy as np
+import os
+
+# Define the path to your preprocessed files
+BASE = "/content/drive/MyDrive/CICIDS2017_Preprocessed"
+
+# Load the preprocessed data
+X_train_benign = np.load(f"{BASE}/X_benign_train.npy")   # benign-only train
+X_val_benign   = np.load(f"{BASE}/X_benign_val.npy")     # benign-only val
+X_test         = np.load(f"{BASE}/X_test.npy")           # mixed (benign + attacks)
+y_test         = np.load(f"{BASE}/y_test.npy")           # 0=benign, 1=attack
+
+# Combine train + val for a bigger benign training set
+X_train = np.vstack([X_train_benign, X_val_benign])
+
+# Print shapes to verify
+print("Train (benign-only):", X_train.shape)
+print("Test (mixed):", X_test.shape, "Attacks in test:", int(y_test.sum()))
+print("Feature count:", X_train.shape[1])
+
+# === Baseline IDS Model (Discriminator) ===
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+
+# -----------------------------
+# 1. Prepare labels for training
+# -----------------------------
+# Since X_train only has benign (normal) traffic, we assign all labels = 0
+y_train = np.zeros(len(X_train))
+
+# -----------------------------
+# 2. Train Random Forest
+# -----------------------------
+print("⏳ Training Random Forest IDS...")
+rf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
+rf.fit(X_train, y_train)
+
+print("✅ Training complete!")
+
+# -----------------------------
+# 3. Test on mixed dataset
+# -----------------------------
+y_pred = rf.predict(X_test)
+
+# -----------------------------
+# 4. Evaluate
+# -----------------------------
+print("\n📊 Evaluation on Test Set:")
+print("Accuracy:", accuracy_score(y_test, y_pred))
+print("\nConfusion Matrix:")
+print(confusion_matrix(y_test, y_pred))
+print("\nClassification Report:")
+print(classification_report(y_test, y_pred, target_names=["Benign", "Attack"]))
+
+!pip install torch torchvision
+
+# === 1️⃣ Imports ===
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
+
+# === 2️⃣ Load preprocessed data ===
+BASE = "/content/drive/MyDrive/CICIDS2017_Preprocessed"
+
+X_train_benign = np.load(f"{BASE}/X_benign_train.npy")
+X_val_benign   = np.load(f"{BASE}/X_benign_val.npy")
+X_test         = np.load(f"{BASE}/X_test.npy")
+y_test         = np.load(f"{BASE}/y_test.npy")
+
+# Combine train + val for bigger benign training set
+X_train = np.vstack([X_train_benign, X_val_benign])
+
+print("Train (benign-only):", X_train.shape)
+print("Test (mixed):", X_test.shape, "Attacks in test:", int(y_test.sum()))
+print("Feature count:", X_train.shape[1])
+
+# === 3️⃣ Convert to PyTorch tensors and create DataLoaders ===
+X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
+X_val_tensor   = torch.tensor(X_val_benign, dtype=torch.float32)
+X_test_tensor  = torch.tensor(X_test, dtype=torch.float32)
+
+batch_size = 128
+train_loader = DataLoader(TensorDataset(X_train_tensor), batch_size=batch_size, shuffle=True)
+val_loader   = DataLoader(TensorDataset(X_val_tensor), batch_size=batch_size, shuffle=False)
+
+# === 4️⃣ Define device ===
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# === 5️⃣ Define Autoencoder model ===
+class Autoencoder(nn.Module):
+    def __init__(self, input_dim):
+        super(Autoencoder, self).__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, 16)
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(16, 32),
+            nn.ReLU(),
+            nn.Linear(32, 64),
+            nn.ReLU(),
+            nn.Linear(64, input_dim)
+        )
+
+    def forward(self, x):
+        encoded = self.encoder(x)
+        decoded = self.decoder(encoded)
+        return decoded
+
+model = Autoencoder(input_dim=X_train.shape[1]).to(device)
+
+# === 6️⃣ Define loss and optimizer ===
+criterion = nn.MSELoss()
+optimizer = optim.Adam(model.parameters(), lr=1e-3)
+
+# === 7️⃣ Train Autoencoder ===
+epochs = 50
+for epoch in range(epochs):
+    model.train()
+    train_loss = 0
+    for batch in train_loader:
+        x = batch[0].to(device)
+        optimizer.zero_grad()
+        x_hat = model(x)
+        loss = criterion(x_hat, x)
+        loss.backward()
+        optimizer.step()
+        train_loss += loss.item() * x.size(0)
+    train_loss /= len(train_loader.dataset)
+    print(f"Epoch [{epoch+1}/{epochs}], Loss: {train_loss:.6f}")
+
+
+model.eval()
+with torch.no_grad():
+    X_test_tensor = X_test_tensor.to(device)
+    X_test_recon = model(X_test_tensor)
+    recon_error = torch.mean((X_test_recon - X_test_tensor) ** 2, dim=1).cpu().numpy()
+
+
+with torch.no_grad():
+    X_val_tensor = X_val_tensor.to(device)
+    val_recon = model(X_val_tensor)
+    val_error = torch.mean((val_recon - X_val_tensor) ** 2, dim=1).cpu().numpy()
+
+threshold = np.percentile(val_error, 95)  # top 5% error = anomaly
+print("Threshold:", threshold)
+
+y_pred = (recon_error > threshold).astype(int)
+
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
+print("Confusion Matrix:\n", confusion_matrix(y_test, y_pred))
+print("\nClassification Report:\n", classification_report(y_test, y_pred, target_names=["Benign", "Attack"]))
+roc_auc = roc_auc_score(y_test, recon_error)
+print("ROC-AUC:", roc_auc)
+
+import matplotlib.pyplot as plt
+import numpy as np
+from sklearn.metrics import confusion_matrix, classification_report, roc_auc_score
+
+# Make sure model and tensors are on GPU
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = model.to(device)
+X_test_tensor = X_test_tensor.to(device)
+X_val_tensor = X_val_tensor.to(device)
+
+# --- 1. Compute reconstruction error ---
+model.eval()
+with torch.no_grad():
+    # Test set
+    X_test_recon = model(X_test_tensor)
+    recon_error_test = torch.mean((X_test_recon - X_test_tensor) ** 2, dim=1).cpu().numpy()
+
+    # Validation benign set
+    X_val_recon = model(X_val_tensor)
+    recon_error_val = torch.mean((X_val_recon - X_val_tensor) ** 2, dim=1).cpu().numpy()
+
+# --- 2. Visualize reconstruction errors ---
+plt.figure(figsize=(10,6))
+plt.hist(recon_error_val, bins=100, alpha=0.6, label='Benign (val)')
+plt.hist(recon_error_test[y_test==1], bins=100, alpha=0.6, label='Attack (test)')
+plt.xlabel('Reconstruction Error')
+plt.ylabel('Number of Samples')
+plt.title('Reconstruction Error Distribution')
+plt.legend()
+plt.show()
+
+# --- 3. Set anomaly threshold ---
+percentile = 95  # adjust 90, 95, 99 to tune recall/precision
+threshold = np.percentile(recon_error_val, percentile)
+print(f"Anomaly Threshold ({percentile}th percentile): {threshold:.8f}")
+
+# --- 4. Predict anomalies ---
+y_pred = (recon_error_test > threshold).astype(int)
+
+# --- 5. Evaluate performance ---
+print("\nConfusion Matrix:\n", confusion_matrix(y_test, y_pred))
+print("\nClassification Report:\n", classification_report(y_test, y_pred, target_names=["Benign", "Attack"]))
+roc_auc = roc_auc_score(y_test, recon_error_test)
+print("ROC-AUC:", roc_auc)
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# --- Hyperparameters ---
+input_dim = X_train.shape[1]
+latent_dim = 32
+batch_size = 128
+epochs = 50
+lr = 0.0002
+
+# --- DataLoader ---
+train_dataset = TensorDataset(torch.tensor(X_train, dtype=torch.float32))
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+
+# --- Generator ---
+class Generator(nn.Module):
+    def __init__(self, latent_dim, output_dim):
+        super(Generator, self).__init__()
+        self.model = nn.Sequential(
+            nn.Linear(latent_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 128),
+            nn.ReLU(),
+            nn.Linear(128, output_dim)
+        )
+    def forward(self, z):
+        return self.model(z)
+
+# --- Discriminator ---
+class Discriminator(nn.Module):
+    def __init__(self, input_dim):
+        super(Discriminator, self).__init__()
+        self.model = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+            nn.Sigmoid()
+        )
+    def forward(self, x):
+        return self.model(x)
+
+# --- Initialize models ---
+G = Generator(latent_dim, input_dim).to(device)
+D = Discriminator(input_dim).to(device)
+
+# --- Optimizers & loss ---
+criterion = nn.BCELoss()
+optimizer_G = optim.Adam(G.parameters(), lr=lr)
+optimizer_D = optim.Adam(D.parameters(), lr=lr)
+
+
+for epoch in range(epochs):
+    for batch in train_loader:
+        real_data = batch[0].to(device)
+        batch_size_curr = real_data.size(0)
+
+        # -------------------------
+        # Train Discriminator
+        # -------------------------
+        # Label smoothing (real=0.9, fake=0.1)
+        real_labels = (torch.ones(batch_size_curr, 1) * 0.9).to(device)
+        fake_labels = (torch.zeros(batch_size_curr, 1) + 0.1).to(device)
+
+        # Add small noise to real data (regularization trick)
+        real_data_noisy = real_data + 0.05 * torch.randn_like(real_data)
+
+        # Fake samples
+        z = torch.randn(batch_size_curr, latent_dim).to(device)
+        fake_data = G(z)
+
+        # Loss for D
+        D_real = D(real_data_noisy)
+        D_fake = D(fake_data.detach())
+        loss_D = criterion(D_real, real_labels) + criterion(D_fake, fake_labels)
+
+        optimizer_D.zero_grad()
+        loss_D.backward()
+        optimizer_D.step()
+
+        # -------------------------
+        # Train Generator
+        # -------------------------
+        # Train G more often (to catch up with D)
+        for _ in range(2):
+            z = torch.randn(batch_size_curr, latent_dim).to(device)
+            fake_data = G(z)
+            D_fake = D(fake_data)
+
+            # Generator wants discriminator to think fake = real
+            loss_G = criterion(D_fake, torch.ones(batch_size_curr, 1).to(device))
+
+            optimizer_G.zero_grad()
+            loss_G.backward()
+            optimizer_G.step()
+
+    print(f"Epoch [{epoch+1}/{epochs}]  Loss_D: {loss_D.item():.6f}  Loss_G: {loss_G.item():.6f}")
+
+
+torch.save(G.state_dict(), "generator.pth")
+torch.save(D.state_dict(), "discriminator.pth")
+
+
+import torch
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Ensure generator G is defined and trained
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+latent_dim = 32  # same as training
+
+# Load trained generator
+G.load_state_dict(torch.load("generator.pth", map_location=device))
+G.to(device)
+G.eval()
+
+# Generate samples
+num_samples = 16
+z = torch.randn(num_samples, latent_dim).to(device)
+fake_vectors = G(z).detach().cpu()  # shape: (16, 78)
+
+print("Generator output shape:", fake_vectors.shape)
+
+# Plot as heatmaps in a 4x4 grid
+fig, axes = plt.subplots(4, 4, figsize=(12, 8))
+fig.suptitle("Synthetic Attack Samples Generated by GAN", fontsize=16, fontweight="bold")
+
+for i, ax in enumerate(axes.flatten()):
+    # Visualize each 78-dim vector as a 1-row heatmap
+    ax.imshow(fake_vectors[i].unsqueeze(0), cmap="viridis", aspect="auto")
+    ax.set_xticks([])  # hide x-axis
+    ax.set_yticks([])  # hide y-axis
+    ax.set_title(f"Sample {i+1}", fontsize=10)
+
+plt.tight_layout(rect=[0, 0, 1, 0.95])
+plt.savefig("synthetic_samples.png", dpi=300)  # save high-res for report
+plt.show()
+
+
+import torch
+import numpy as np
+import os
+
+# Settings (change only these)
+GEN_PATH = "generator.pth"
+OUT_PATH = "synthetic_attacks.npy"
+LATENT_DIM = 32      # MUST match the latent dim used during training
+NUM_SAMPLES = 10000    # how many synthetic samples you want
+BATCH = 256
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Load generator (assumes G is already defined in this script/notebook with same architecture)
+G.load_state_dict(torch.load(GEN_PATH, map_location=device))
+G.to(device)
+G.eval()
+
+# Generate in batches (prevents OOM)
+synthetic_parts = []
+with torch.no_grad():
+    remaining = NUM_SAMPLES
+    while remaining > 0:
+        b = min(BATCH, remaining)
+        z = torch.randn(b, LATENT_DIM, device=device)
+        out = G(z).cpu().numpy()
+        synthetic_parts.append(out)
+        remaining -= b
+
+synthetic = np.vstack(synthetic_parts)
+np.save(OUT_PATH, synthetic)
+print("Saved synthetic samples:", OUT_PATH)
+print("Shape:", synthetic.shape)
+print("Per-feature sample: min, mean, max (first 5 features):")
+print(np.min(synthetic, axis=0)[:5])
+print(np.mean(synthetic, axis=0)[:5])
+print(np.max(synthetic, axis=0)[:5])
+
+from google.colab import files
+
+files.download("synthetic_attacks.npy")
+
+!find /content/drive/MyDrive/ -name "synthetic_attacks.npy"
+
+import numpy as np
+import pandas as pd
+import os
+from google.colab import drive
+
+# Mount Drive
+drive.mount('/content/drive', force_remount=True)
+
+# Use the correct path found via `find`
+npy_file = "/content/drive/MyDrive/Synthetic_data/synthetic_attacks.npy"
+csv_file = "/content/drive/MyDrive/Synthetic_data/synthetic_attacks.csv"
+
+# Verify file exists
+if not os.path.isfile(npy_file):
+    raise FileNotFoundError(f"The file was not found: {npy_file}")
+
+# Convert npy -> csv
+data = np.load(npy_file, allow_pickle=True)
+df = pd.DataFrame(data)
+df.to_csv(csv_file, index=False)
+
+print(f"CSV saved successfully at {csv_file}")
+
+torch.save(D.state_dict(), "discriminator.pth")
+
+torch.save(D.state_dict(), "/content/drive/MyDrive/CICIDS2017_Preprocessed/discriminator.pth")
+print("Discriminator saved successfully!")
+
+
+D.load_state_dict(torch.load("/content/drive/MyDrive/CICIDS2017_Preprocessed/discriminator.pth", map_location=device))
+
+
+class Discriminator(nn.Module):
+    def __init__(self, input_dim):
+        super(Discriminator, self).__init__()
+        self.model = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+            nn.Sigmoid()
+        )
+    def forward(self, x):
+        return self.model(x)
+D = Discriminator(input_dim=X_test.shape[1]).to(device)
+D.load_state_dict(torch.load("discriminator.pth", map_location=device))
+D.eval()
+
+
+X_val_tensor = torch.tensor(X_val_benign, dtype=torch.float32).to(device)
+
+with torch.no_grad():
+    val_scores = D(X_val_tensor).cpu().numpy().flatten()
+
+threshold = np.percentile(val_scores, 5)  # low score = anomaly
+print("GAN anomaly threshold:", threshold)
+
+
+# Convert test set to tensor
+X_test_tensor = torch.tensor(X_test, dtype=torch.float32).to(device)
+
+# Get Discriminator scores
+with torch.no_grad():
+    scores = D(X_test_tensor).cpu().numpy().flatten()  # values between 0 and 1
+
+y_pred_gan = (scores < threshold).astype(int)
+
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
+
+print("\n=== GAN IDS Evaluation ===")
+print("Confusion Matrix:\n", confusion_matrix(y_test, y_pred_gan))
+print("\nClassification Report:\n", classification_report(y_test, y_pred_gan, target_names=["Benign", "Attack"]))
+roc_auc_gan = roc_auc_score(y_test, 1 - scores)  # invert since low score = anomaly
+print("ROC-AUC:", roc_auc_gan)
+
+BASE = "/content/drive/MyDrive/YourActualFolderName"
+
+
+!ls
+
+import numpy as np
+
+# Path to your preprocessed data
+BASE = "/content/drive/MyDrive/CICIDS2017_Preprocessed"
+
+# Load datasets
+X_test = np.load(f"{BASE}/X_test.npy")          # mixed benign + attack
+y_test = np.load(f"{BASE}/y_test.npy")          # 0 = benign, 1 = attack
+X_val_benign = np.load(f"{BASE}/X_benign_val.npy")  # only benign samples
+
+print("X_test shape:", X_test.shape)
+print("y_test distribution:", np.bincount(y_test))
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+!ls /content/drive/MyDrive/CICIDS2017_Preprocessed/
+
+import numpy as np
+
+# Path to your preprocessed data
+BASE = "/content/drive/MyDrive/CICIDS2017_Preprocessed"
+
+# Load datasets
+X_test = np.load(f"{BASE}/X_test.npy")          # mixed benign + attack
+y_test = np.load(f"{BASE}/y_test.npy")          # 0 = benign, 1 = attack
+X_val_benign = np.load(f"{BASE}/X_benign_val.npy")  # only benign samples
+
+print("X_test shape:", X_test.shape)
+print("y_test distribution:", np.bincount(y_test))
+
+import torch
+import numpy as np
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
+import matplotlib.pyplot as plt
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# --- Load trained Discriminator ---
+class Discriminator(nn.Module):
+    def __init__(self, input_dim):
+        super(Discriminator, self).__init__()
+        self.model = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+            nn.Sigmoid()  # still using sigmoid for score between 0 and 1
+        )
+    def forward(self, x):
+        return self.model(x)
+
+D = Discriminator(input_dim=X_test.shape[1]).to(device)
+D.load_state_dict(torch.load("/content/drive/MyDrive/CICIDS2017_Preprocessed/discriminator.pth", map_location=device))
+D.eval()
+
+# --- Convert data to tensors ---
+X_test_tensor = torch.tensor(X_test, dtype=torch.float32).to(device)
+X_val_tensor = torch.tensor(X_val_benign, dtype=torch.float32).to(device)
+
+# --- Score samples using Discriminator ---
+with torch.no_grad():
+    val_scores = D(X_val_tensor).cpu().numpy().flatten()
+    test_scores = D(X_test_tensor).cpu().numpy().flatten()
+
+# --- Set anomaly threshold (5th percentile of benign scores) ---
+threshold = np.percentile(val_scores, 5)
+print("GAN anomaly threshold:", threshold)
+
+# --- Predict anomalies: low score = anomaly ---
+y_pred_gan = (test_scores < threshold).astype(int)
+
+# --- Evaluate performance ---
+print("\n=== GAN IDS Evaluation ===")
+print("Confusion Matrix:\n", confusion_matrix(y_test, y_pred_gan))
+print("\nClassification Report:\n", classification_report(y_test, y_pred_gan, target_names=["Benign", "Attack"]))
+roc_auc_gan = roc_auc_score(y_test, 1 - test_scores)  # invert since low score = anomaly
+print("ROC-AUC:", roc_auc_gan)
+
+# --- Optional: Visualize score distributions ---
+plt.figure(figsize=(10,6))
+plt.hist(val_scores, bins=100, alpha=0.6, label='Benign (val)')
+plt.hist(test_scores[y_test==1], bins=100, alpha=0.6, label='Attack (test)')
+plt.xlabel('Discriminator Score')
+plt.ylabel('Number of Samples')
+plt.title('Discriminator Score Distribution')
+plt.legend()
+plt.show()
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+import numpy as np
+
+BASE = "/content/drive/MyDrive/CICIDS2017_Preprocessed"
+
+# Load datasets
+X_train_benign = np.load(f"{BASE}/X_benign_train.npy")
+X_val_benign   = np.load(f"{BASE}/X_benign_val.npy")
+X_test         = np.load(f"{BASE}/X_test.npy")
+y_test         = np.load(f"{BASE}/y_test.npy")
+
+print("X_test shape:", X_test.shape)
+print("X_val_benign shape:", X_val_benign.shape)
+
+
+import torch
+import torch.nn as nn
+
+class Discriminator(nn.Module):
+    def __init__(self, input_dim):
+        super(Discriminator, self).__init__()
+        self.model = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+            nn.Sigmoid()  # outputs score between 0 and 1
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+
+input_dim = X_test.shape[1]  # should be 78
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+D = Discriminator(input_dim=input_dim).to(device)
+
+# Load your trained Discriminator weights
+D.load_state_dict(torch.load("/content/drive/MyDrive/CICIDS2017_Preprocessed/discriminator.pth", map_location=device))
+D.eval()
+
+with torch.no_grad():
+    val_scores = D(X_val_tensor).cpu().numpy().flatten()
+    test_scores = D(X_test_tensor).cpu().numpy().flatten()
+
+
+import numpy as np
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
+
+# Combine scores: higher = more suspicious
+alpha = 0.5  # weight for Autoencoder (you can tune this later)
+combined_score = alpha * recon_error_test + (1 - alpha) * (1 - test_scores)
+
+# Set threshold using validation set
+val_combined_score = alpha * val_error + (1 - alpha) * (1 - val_scores)
+threshold = np.percentile(val_combined_score, 95)
+print("Ensemble anomaly threshold:", threshold)
+
+# Predict: if score > threshold → attack
+y_pred_combined = (combined_score > threshold).astype(int)
+
+# Evaluate
+print("\n=== Ensemble IDS Evaluation ===")
+print("Confusion Matrix:\n", confusion_matrix(y_test, y_pred_combined))
+print("\nClassification Report:\n", classification_report(y_test, y_pred_combined, target_names=["Benign", "Attack"]))
+roc_auc_combined = roc_auc_score(y_test, combined_score)
+print("ROC-AUC:", roc_auc_combined)
+
+
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
+
+for alpha in [0.3, 0.5, 0.7]:
+    print(f"\n=== Ensemble Evaluation for alpha = {alpha} ===")
+
+    # Combine scores
+    combined_score = alpha * recon_error_test + (1 - alpha) * (1 - test_scores)
+    val_combined_score = alpha * val_error + (1 - alpha) * (1 - val_scores)
+
+    # Threshold at 95th percentile
+    threshold = np.percentile(val_combined_score, 95)
+    print("Threshold:", threshold)
+
+    # Predict
+    y_pred_combined = (combined_score > threshold).astype(int)
+
+    # Evaluate
+    print("Confusion Matrix:\n", confusion_matrix(y_test, y_pred_combined))
+    print("Classification Report:\n", classification_report(y_test, y_pred_combined, target_names=["Benign", "Attack"]))
+    roc_auc = roc_auc_score(y_test, combined_score)
+    print("ROC-AUC:", roc_auc)
+
+
+# Load previously computed scores
+# These should already exist from your Autoencoder and GAN evaluation
+
+# Autoencoder reconstruction errors
+# recon_error_test: from AE on test set
+# val_error: from AE on validation set
+
+# GAN Discriminator scores
+# test_scores: from D on test set
+# val_scores: from D on validation set
+
+# True labels
+# y_test: 0 = benign, 1 = attack
+
+# Make sure these variables are already in memory
+print("AE test error shape:", recon_error_test.shape)
+print("GAN test score shape:", test_scores.shape)
+print("y_test shape:", y_test.shape)
+
+# Combine AE and GAN scores
+alpha = 0.5  # weight for Autoencoder (you can tune this later)
+
+# Flip GAN scores so higher = more suspicious
+combined_score = alpha * recon_error_test + (1 - alpha) * (1 - test_scores)
+
+# Do the same for validation set to find threshold
+val_combined_score = alpha * val_error + (1 - alpha) * (1 - val_scores)
+
+# Set threshold at 95th percentile of benign validation scores
+threshold = np.percentile(val_combined_score, 95)
+print("Ensemble anomaly threshold:", threshold)
+
+
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
+
+# Predict: if score > threshold → attack
+y_pred_combined = (combined_score > threshold).astype(int)
+
+# Evaluate
+print("\n=== Ensemble IDS Evaluation ===")
+print("Confusion Matrix:\n", confusion_matrix(y_test, y_pred_combined))
+print("\nClassification Report:\n", classification_report(y_test, y_pred_combined, target_names=["Benign", "Attack"]))
+roc_auc_combined = roc_auc_score(y_test, combined_score)
+print("ROC-AUC:", roc_auc_combined)
+
+
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(10,6))
+plt.hist(val_combined_score, bins=100, alpha=0.6, label='Benign (val)')
+plt.hist(combined_score[y_test==1], bins=100, alpha=0.6, label='Attack (test)')
+plt.xlabel('Combined Anomaly Score')
+plt.ylabel('Number of Samples')
+plt.title('Ensemble Score Distribution')
+plt.legend()
+plt.show()
+
+
+import numpy as np
+
+# Load synthetic attack samples generated by your GAN
+X_synthetic_attacks = np.load("/content/drive/MyDrive/Synthetic_data/synthetic_attacks.npy")
+print("Synthetic attack shape:", X_synthetic_attacks.shape)
+
+
+# Load real benign training samples
+X_benign = np.load("/content/drive/MyDrive/CICIDS2017_Preprocessed/X_benign_train.npy")
+
+# Create labels
+y_benign = np.zeros(X_benign.shape[0])
+y_synthetic = np.ones(X_synthetic_attacks.shape[0])
+
+# Combine
+X_train_combined = np.vstack((X_benign, X_synthetic_attacks))
+y_train_combined = np.concatenate((y_benign, y_synthetic))
+
+print("Combined training shape:", X_train_combined.shape)
+
+
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
+
+# Train
+clf = RandomForestClassifier(n_estimators=100, random_state=42)
+clf.fit(X_train_combined, y_train_combined)
+
+# Predict on real test set
+y_pred_rf = clf.predict(X_test)
+y_proba_rf = clf.predict_proba(X_test)[:, 1]
+
+# Evaluate
+print("=== Classifier Evaluation ===")
+print("Confusion Matrix:\n", confusion_matrix(y_test, y_pred_rf))
+print("\nClassification Report:\n", classification_report(y_test, y_pred_rf, target_names=["Benign", "Attack"]))
+print("ROC-AUC:", roc_auc_score(y_test, y_proba_rf))
+
+
+pip install PyQt5
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+import torch
+import torch.nn as nn
+
+class Discriminator(nn.Module):
+    def __init__(self, input_dim):
+        super(Discriminator, self).__init__()
+        self.model = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.LeakyReLU(0.2),
+            nn.Linear(128, 64),
+            nn.LeakyReLU(0.2),
+            nn.Linear(64, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+pip install streamlit
+
+
+!pip install streamlit pyngrok
+
+
+# 🔹 1. Mount Google Drive
+from google.colab import drive
+drive.mount('/content/drive')
+
+# 🔹 2. Load Data
+import numpy as np
+
+X = np.load("/content/drive/MyDrive/CICIDS2017_Preprocessed/X_test.npy")  # shape: (N, F)
+y = np.load("/content/drive/MyDrive/CICIDS2017_Preprocessed/y_test.npy")  # shape: (N,)
+
+# 🔹 3. Convert to Tensors
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.model_selection import train_test_split
+
+X_tensor = torch.tensor(X, dtype=torch.float32)
+y_tensor = torch.tensor(y, dtype=torch.float32).unsqueeze(1)  # shape: (N, 1)
+
+# 🔹 4. Split into Train and Validation
+X_train, X_val, y_train, y_val = train_test_split(X_tensor, y_tensor, test_size=0.2, random_state=42)
+
+# 🔹 5. Define Discriminator Model
+class Discriminator(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+            nn.Sigmoid()
+        )
+    def forward(self, x):
+        return self.net(x)
+
+D = Discriminator(X.shape[1])
+
+# 🔹 6. Training Setup
+criterion = nn.BCELoss()
+optimizer = optim.Adam(D.parameters(), lr=0.001)
+epochs = 10
+
+# 🔹 7. Training Loop
+for epoch in range(epochs):
+    D.train()
+    optimizer.zero_grad()
+    outputs = D(X_train)
+    loss = criterion(outputs, y_train)
+    loss.backward()
+    optimizer.step()
+
+    D.eval()
+    with torch.no_grad():
+        val_outputs = D(X_val)
+        val_loss = criterion(val_outputs, y_val)
+        val_preds = (val_outputs > 0.5).float()
+        acc = (val_preds == y_val).float().mean()
+
+    print(f"Epoch {epoch+1}/{epochs} - Train Loss: {loss.item():.4f} - Val Loss: {val_loss.item():.4f} - Val Acc: {acc.item():.4f}")
+
+# 🔹 8. Save Model to Drive
+torch.save(D.state_dict(), "/content/drive/MyDrive/CICIDS2017_Preprocessed/discriminator.pth")
+print("✅ Discriminator trained and saved to Drive.")
+
+
+X_test = np.load("/content/drive/MyDrive/CICIDS2017_Preprocessed/X_test.npy")
+y_test = np.load("/content/drive/MyDrive/CICIDS2017_Preprocessed/y_test.npy")
+
+
+import os
+os.listdir("/content/drive/MyDrive/CICIDS2017_Preprocessed")
+
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+import numpy as np
+
+# Load the true labels
+y_test = np.load("/content/drive/MyDrive/CICIDS2017_Preprocessed/y_test.npy")
+
+# Find indices of attack samples (label = 1)
+attack_indices = np.where(y_test == 1)[0]
+
+# Print the first few attack indices
+print("Attack sample indices:", attack_indices[:10])
+print(f"Total attack samples in test set: {len(attack_indices)}")
+
